@@ -213,3 +213,55 @@ func TestConnTrackerRateLimitHonorsContextCancellation(t *testing.T) {
 		t.Fatalf("second Write() = (%d, %v), want (0, context canceled)", n, err)
 	}
 }
+
+func TestConnTrackerSetUserMapClosesRemovedUsersConnections(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"uuid-1": 1, "uuid-2": 2})
+
+	removedA := &testConn{reads: [][]byte{[]byte("hello")}}
+	removedB := &testConn{}
+	kept := &testConn{}
+	wrappedA := tracker.RoutedConnection(context.Background(), removedA, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
+	tracker.RoutedConnection(context.Background(), removedB, testInboundContext("uuid-1", "1.1.1.2"), nil, nil)
+	tracker.RoutedConnection(context.Background(), kept, testInboundContext("uuid-2", "2.2.2.2"), nil, nil)
+	if _, err := wrappedA.Read(make([]byte, 16)); err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	tracker.SetUserMap(map[string]int{"uuid-2": 2})
+
+	if !removedA.closed || !removedB.closed {
+		t.Fatal("expected removed user's connections to be closed")
+	}
+	if kept.closed {
+		t.Fatal("remaining user's connection must stay open")
+	}
+	traffic, _, connCount := tracker.GetUserTraffic()
+	if got := traffic[1]; got != [2]int64{5, 0} {
+		t.Fatalf("removed user's traffic = %v, want [5 0] still reported", got)
+	}
+	if connCount != 1 {
+		t.Fatalf("connCount = %d, want 1", connCount)
+	}
+	if len(tracker.userConns["uuid-1"]) != 0 || len(tracker.connMap) != 1 {
+		t.Fatalf("closed connections should be released: userConns=%v connMap=%d", tracker.userConns, len(tracker.connMap))
+	}
+}
+
+func TestConnTrackerRejectsRemovedUser(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"uuid-1": 1, "uuid-2": 2})
+	tracker.SetUserMap(map[string]int{"uuid-2": 2})
+
+	// e.g. a new mux sub-stream on a session authenticated before removal
+	late := &testConn{}
+	wrapped := tracker.RoutedConnection(context.Background(), late, testInboundContext("uuid-1", "1.1.1.1"), nil, nil)
+	if wrapped != late || !late.closed {
+		t.Fatal("expected connection of removed user to be rejected and closed")
+	}
+
+	ok := &testConn{}
+	if wrapped := tracker.RoutedConnection(context.Background(), ok, testInboundContext("uuid-2", "2.2.2.2"), nil, nil); wrapped == ok || ok.closed {
+		t.Fatal("current user's connection should be tracked, not rejected")
+	}
+}

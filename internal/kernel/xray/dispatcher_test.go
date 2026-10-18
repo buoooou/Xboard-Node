@@ -1,11 +1,16 @@
 package xray
 
 import (
+	"context"
+	"net"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/xtls/xray-core/common/buf"
+	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/transport"
 )
 
@@ -195,7 +200,7 @@ func TestLimitDispatcher_TrackLinkPreservesReader(t *testing.T) {
 	origWriter := &closeTrackingWriter{Writer: buf.Discard, onClose: func() {}}
 	link := &transport.Link{Reader: origReader, Writer: origWriter}
 
-	ld.trackLink(link, email, "1.1.1.1", true)
+	ld.trackLink(context.Background(), link, email, "1.1.1.1", true)
 
 	if link.Reader != origReader {
 		t.Fatal("trackLink must not replace link.Reader")
@@ -214,7 +219,7 @@ func TestLimitDispatcher_CloseTrackingWriterReleasesConn(t *testing.T) {
 	}
 
 	link := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
-	ld.trackLink(link, email, "1.1.1.1", true)
+	ld.trackLink(context.Background(), link, email, "1.1.1.1", true)
 
 	if got := ld.connCount.Load(); got != 1 {
 		t.Fatalf("expected connCount=1 after tracking, got %d", got)
@@ -231,5 +236,89 @@ func TestLimitDispatcher_CloseTrackingWriterReleasesConn(t *testing.T) {
 	}
 	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
 		t.Fatal("device slot should be released after writer close")
+	}
+}
+
+type closeFlagConn struct {
+	closed atomic.Bool
+}
+
+func (c *closeFlagConn) Read([]byte) (int, error)         { return 0, nil }
+func (c *closeFlagConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (c *closeFlagConn) Close() error                     { c.closed.Store(true); return nil }
+func (c *closeFlagConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *closeFlagConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *closeFlagConn) SetDeadline(time.Time) error      { return nil }
+func (c *closeFlagConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *closeFlagConn) SetWriteDeadline(time.Time) error { return nil }
+
+func inboundCtx(conn net.Conn) context.Context {
+	return session.ContextWithInbound(context.Background(), &session.Inbound{
+		Source: xnet.TCPDestination(xnet.ParseAddress("1.1.1.1"), 443),
+		Conn:   conn,
+	})
+}
+
+func TestLimitDispatcher_CloseUserClosesOnlyThatUser(t *testing.T) {
+	ld := newTestDispatcher()
+	email1, email2 := userEmail(1), userEmail(2)
+
+	conn1 := &closeFlagConn{}
+	link1a := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
+	link1b := &transport.Link{Reader: nopReader{}, Writer: buf.Discard} // e.g. a second mux sub-stream
+	ld.trackLink(inboundCtx(conn1), link1a, email1, "1.1.1.1", true)
+	ld.trackLink(inboundCtx(conn1), link1b, email1, "1.1.1.1", true)
+
+	conn2 := &closeFlagConn{}
+	link2 := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
+	ld.trackLink(inboundCtx(conn2), link2, email2, "2.2.2.2", true)
+
+	if got := ld.CloseUser(email1); got != 2 {
+		t.Fatalf("CloseUser() = %d, want 2", got)
+	}
+	if !conn1.closed.Load() {
+		t.Fatal("expected removed user's client connection to be closed")
+	}
+	if conn2.closed.Load() {
+		t.Fatal("other user's connection must stay open")
+	}
+	if got := ld.connCount.Load(); got != 1 {
+		t.Fatalf("connCount = %d, want 1", got)
+	}
+	if _, ok := ld.userLinks[email1]; ok {
+		t.Fatal("removed user's links should be released")
+	}
+	if got := ld.CloseUser(email1); got != 0 {
+		t.Fatalf("second CloseUser() = %d, want 0", got)
+	}
+}
+
+func TestLimitDispatcher_CloseUserWithoutClientConn(t *testing.T) {
+	ld := newTestDispatcher()
+	email := userEmail(1)
+	link := &transport.Link{Reader: nopReader{}, Writer: buf.Discard}
+	ld.trackLink(context.Background(), link, email, "1.1.1.1", true)
+
+	if got := ld.CloseUser(email); got != 1 {
+		t.Fatalf("CloseUser() = %d, want 1", got)
+	}
+	if got := ld.connCount.Load(); got != 0 {
+		t.Fatalf("connCount = %d, want 0 after interrupting the link", got)
+	}
+}
+
+func TestLimitDispatcher_IsRemovedUser(t *testing.T) {
+	ld := newTestDispatcher()
+	email1, email2 := userEmail(1), userEmail(2)
+
+	if ld.isRemovedUser(email1) {
+		t.Fatal("nobody is removed before the user set is known")
+	}
+	ld.UpdateLimits(map[string]int{email2: 2}, nil, nil)
+	if !ld.isRemovedUser(email1) {
+		t.Fatal("user missing from the current set should be rejected")
+	}
+	if ld.isRemovedUser(email2) {
+		t.Fatal("current user must not be rejected")
 	}
 }

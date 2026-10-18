@@ -90,7 +90,7 @@ func (x *Xray) Capabilities() kernel.Capabilities {
 		BuiltInTrafficStats:  true,
 		AliveIPTracking:      true,
 		ForceCloseConnection: false,
-		ForceCloseUser:       false,
+		ForceCloseUser:       true,
 	}
 }
 
@@ -250,9 +250,36 @@ func (x *Xray) CloseConnection(_ context.Context, _ string) error {
 	return nil
 }
 
-func (x *Xray) CloseUserConnections(_ context.Context, _ string) error {
-	// No-op: handled by RemoveUsers at the xray core level.
+func (x *Xray) CloseUserConnections(_ context.Context, uuid string) error {
+	x.mu.Lock()
+	users := x.users
+	x.mu.Unlock()
+	for _, u := range users {
+		if u.UUID == uuid {
+			x.closeUsers([]model.UserSpec{u})
+			break
+		}
+	}
 	return nil
+}
+
+// closeUsers terminates the active connections of the given users. Called
+// after the dispatcher limits are refreshed, so mux sub-streams opened in the
+// meantime are rejected as well.
+func (x *Xray) closeUsers(users []model.UserSpec) {
+	x.mu.Lock()
+	ld := x.limitDispatcher
+	x.mu.Unlock()
+	if ld == nil || len(users) == 0 {
+		return
+	}
+	closed := 0
+	for _, u := range users {
+		closed += ld.CloseUser(userEmail(u.ID))
+	}
+	if closed > 0 {
+		nlog.Core().Info("xray: closed connections of removed users", "users", len(users), "conns", closed)
+	}
 }
 
 // SetSpeedLimitFunc wires xray's patched bandwidth feature to the shared
@@ -360,8 +387,8 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	return added, nil
 }
 
-// RemoveUsers removes users from the running kernel via xray's UserManager API.
-// Truly hitless for supported protocols — remaining connections unaffected.
+// RemoveUsers removes users from the running kernel via xray's UserManager API
+// and closes their connections. Remaining users' connections are unaffected.
 func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	x.mu.Lock()
 	if x.instance == nil {
@@ -420,6 +447,7 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	x.mu.Unlock()
 	x.updateDispatcherLimits(kept)
 	x.updateBandwidthLimits(kept)
+	x.closeUsers(users)
 
 	nlog.Core().Info("xray: users removed via UserManager", "removed", actualRemoved, "total", len(kept))
 	return actualRemoved, nil
@@ -488,6 +516,7 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 	x.mu.Unlock()
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
+	x.closeUsers(toRemove)
 
 	nlog.Core().Info("xray: users updated via UserManager", "added", added, "removed", removed, "total", len(users))
 	return

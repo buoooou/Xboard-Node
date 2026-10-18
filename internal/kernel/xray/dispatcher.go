@@ -3,6 +3,7 @@ package xray
 import (
 	"context"
 	"errors"
+	"io"
 	"reflect"
 	"sort"
 	"sync"
@@ -52,6 +53,7 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 		inner:      orig,
 		innerDisp:  inner,
 		limitedIPs: make(map[string]map[string]int),
+		userLinks:  make(map[string]map[*transport.Link]io.Closer),
 	}
 	globalLimitDispatcher.Store(ld)
 	nlog.Core().Debug("xray: limit dispatcher installed")
@@ -81,6 +83,11 @@ type LimitDispatcher struct {
 	unlimitedIPs sync.Map // email → *ipCounter
 
 	connCount atomic.Int64 // total active connections tracked by dispatcher
+
+	// userLinks: email → active links and the client connection each rides on
+	// (nil when the inbound doesn't expose it), for closing a removed user.
+	linksMu   sync.Mutex
+	userLinks map[string]map[*transport.Link]io.Closer
 }
 
 // ipCounter tracks IPs for unlimited users without any lock.
@@ -117,7 +124,7 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 	}
 
 	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
+		d.trackLink(ctx, link, email, sourceIP, isTCP)
 	}
 	return link, nil
 }
@@ -129,7 +136,7 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 	}
 
 	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
+		d.trackLink(ctx, link, email, sourceIP, isTCP)
 	}
 	return d.innerDisp.DispatchLink(ctx, dest, link)
 }
@@ -146,6 +153,13 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 	sourceIP = si.Source.Address.IP().String()
 	isTCP = dest.Network == net.Network_TCP
 
+	// The inbound rejects removed users at handshake, but mux/XUDP sub-streams
+	// ride on an already authenticated session and arrive here.
+	if d.isRemovedUser(email) {
+		nlog.Core().Debug("xray: rejecting stream of removed user", "email", email, "ip", sourceIP)
+		return "", "", false, errors.New("user removed: " + email)
+	}
+
 	if d.checkDeviceLimit(email, sourceIP, isTCP) {
 		nlog.Core().Debug("xray: device limit exceeded", "email", email, "ip", sourceIP)
 		return "", "", false, errors.New("device limit exceeded for " + email)
@@ -156,14 +170,38 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 // trackLink records connection lifecycle without mutating xray-core owned
 // transport primitives. This keeps mux/XUDP compatible while still allowing
 // the dispatcher to release device-limit state when the link closes.
-func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string, isTCP bool) {
+func (d *LimitDispatcher) trackLink(ctx context.Context, link *transport.Link, email, sourceIP string, isTCP bool) {
 	d.connCount.Add(1)
+
+	var clientConn io.Closer
+	if si := session.InboundFromContext(ctx); si != nil && si.Conn != nil {
+		clientConn = si.Conn
+	}
+	d.linksMu.Lock()
+	if d.userLinks == nil {
+		d.userLinks = make(map[string]map[*transport.Link]io.Closer)
+	}
+	links := d.userLinks[email]
+	if links == nil {
+		links = make(map[*transport.Link]io.Closer)
+		d.userLinks[email] = links
+	}
+	links[link] = clientConn
+	d.linksMu.Unlock()
 
 	onClose := func() {
 		if isTCP {
 			d.delConn(email, sourceIP)
 		}
 		d.connCount.Add(-1)
+		d.linksMu.Lock()
+		if links := d.userLinks[email]; links != nil {
+			delete(links, link)
+			if len(links) == 0 {
+				delete(d.userLinks, email)
+			}
+		}
+		d.linksMu.Unlock()
 	}
 
 	link.Writer = &closeTrackingWriter{
@@ -200,6 +238,40 @@ func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, 
 
 }
 
+// isRemovedUser reports whether email is missing from the current user set.
+// Before the first UpdateLimits the set is unknown and nobody is rejected.
+func (d *LimitDispatcher) isRemovedUser(email string) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if len(d.emailToUID) == 0 {
+		return false
+	}
+	_, ok := d.emailToUID[email]
+	return !ok
+}
+
+// CloseUser terminates every active link of a user: it closes the client
+// connection the link rides on (which also ends a mux session) and interrupts
+// the link's pipes. Returns the number of links closed.
+func (d *LimitDispatcher) CloseUser(email string) int {
+	d.linksMu.Lock()
+	links := make(map[*transport.Link]io.Closer, len(d.userLinks[email]))
+	for l, c := range d.userLinks[email] {
+		links[l] = c
+	}
+	d.linksMu.Unlock()
+
+	// Outside the lock: interrupting the writer runs onClose, which takes it.
+	for l, c := range links {
+		if c != nil {
+			c.Close()
+		}
+		common.Interrupt(l.Writer)
+		common.Interrupt(l.Reader)
+	}
+	return len(links)
+}
+
 func (d *LimitDispatcher) ResetConns() {
 	d.mu.Lock()
 	d.limitedIPs = make(map[string]map[string]int)
@@ -210,6 +282,10 @@ func (d *LimitDispatcher) ResetConns() {
 		d.unlimitedIPs.Delete(key)
 		return true
 	})
+
+	d.linksMu.Lock()
+	d.userLinks = make(map[string]map[*transport.Link]io.Closer)
+	d.linksMu.Unlock()
 
 	d.connCount.Store(0)
 }

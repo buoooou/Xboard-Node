@@ -457,8 +457,8 @@ func (s *SingBox) AddUsers(users []model.UserSpec) (int, error) {
 	return len(toAdd), nil
 }
 
-// RemoveUsers hot-swaps users out of running inbounds. Zero connection disruption
-// for remaining users.
+// RemoveUsers hot-swaps users out of running inbounds and closes the removed
+// users' connections. Zero connection disruption for remaining users.
 func (s *SingBox) RemoveUsers(users []model.UserSpec) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

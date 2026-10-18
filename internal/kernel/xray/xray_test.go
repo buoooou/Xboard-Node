@@ -166,10 +166,10 @@ func TestXraySetSpeedLimitFuncUsesPatchedCorePath(t *testing.T) {
 func TestXrayCapabilities(t *testing.T) {
 	x := New(config.KernelConfig{Type: "xray"})
 	caps := x.Capabilities()
-	if !caps.PerUserSpeedLimit || !caps.DeviceLimit || !caps.BuiltInTrafficStats || !caps.AliveIPTracking {
+	if !caps.PerUserSpeedLimit || !caps.DeviceLimit || !caps.BuiltInTrafficStats || !caps.AliveIPTracking || !caps.ForceCloseUser {
 		t.Fatalf("unexpected positive xray capabilities: %+v", caps)
 	}
-	if caps.ForceCloseConnection || caps.ForceCloseUser {
+	if caps.ForceCloseConnection {
 		t.Fatalf("unexpected force-close xray capabilities: %+v", caps)
 	}
 }

@@ -122,10 +122,11 @@ func (u *userStats) aliveIPList() map[string]bool {
 //   - Close callback to decrement IP refcounts
 //   - Per-connection rate limit token accumulation (amortized WaitN)
 type ConnTracker struct {
-	usersMu sync.RWMutex
-	users   map[int]*userStats  // userID → stats
-	uuidMap map[string]int      // UUID → userID (for lookup in RoutedConnection)
-	connMap map[string]net.Conn // connID → conn (only for force-close support)
+	usersMu   sync.RWMutex
+	users     map[int]*userStats             // userID → stats
+	uuidMap   map[string]int                 // UUID → userID (for lookup in RoutedConnection)
+	connMap   map[string]io.Closer           // connID → tracked conn (TCP and UDP), for force-close
+	userConns map[string]map[string]struct{} // UUID → connIDs, for closing a removed user's connections
 
 	idCounter atomic.Int64
 
@@ -146,7 +147,8 @@ func NewConnTracker(_ int) *ConnTracker {
 	return &ConnTracker{
 		users:         make(map[int]*userStats),
 		uuidMap:       make(map[string]int),
-		connMap:       make(map[string]net.Conn),
+		connMap:       make(map[string]io.Closer),
+		userConns:     make(map[string]map[string]struct{}),
 		globalDevices: make(map[int]map[string]bool),
 	}
 }
@@ -162,15 +164,58 @@ func (t *ConnTracker) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) {
 }
 
 // SetUserMap replaces the UUID→userID mapping and ensures per-user stats
-// structs exist for all users. Old users that are no longer present keep
-// their stats until their connections drain.
+// structs exist for all users. Connections of UUIDs that are no longer
+// present are closed; their stats are kept so the final bytes still get
+// reported.
 func (t *ConnTracker) SetUserMap(m map[string]int) {
 	t.usersMu.Lock()
+	var removed []string
+	for uuid := range t.uuidMap {
+		if _, ok := m[uuid]; !ok {
+			removed = append(removed, uuid)
+		}
+	}
 	t.uuidMap = m
 	for _, uid := range m {
 		if _, ok := t.users[uid]; !ok {
 			t.users[uid] = &userStats{ips: make(map[string]int)}
 		}
+	}
+	t.usersMu.Unlock()
+
+	closed := 0
+	for _, uuid := range removed {
+		closed += t.CloseByUUID(uuid)
+	}
+	if closed > 0 {
+		nlog.Core().Info("singbox: closed connections of removed users", "users", len(removed), "conns", closed)
+	}
+}
+
+// isRemovedUser reports whether uuid belongs to a user no longer in the user
+// map. Inbounds already reject removed users at handshake, but mux sub-streams
+// ride on an authenticated session and must be rejected here.
+func (t *ConnTracker) isRemovedUser(uuid string) bool {
+	if uuid == "" {
+		return false
+	}
+	t.usersMu.RLock()
+	defer t.usersMu.RUnlock()
+	_, ok := t.uuidMap[uuid]
+	return !ok && len(t.uuidMap) > 0
+}
+
+// addConnRef registers a tracked connection for force-close support.
+func (t *ConnTracker) addConnRef(uuid, connID string, c io.Closer) {
+	t.usersMu.Lock()
+	t.connMap[connID] = c
+	if uuid != "" {
+		ids := t.userConns[uuid]
+		if ids == nil {
+			ids = make(map[string]struct{})
+			t.userConns[uuid] = ids
+		}
+		ids[connID] = struct{}{}
 	}
 	t.usersMu.Unlock()
 }
@@ -212,6 +257,12 @@ func (t *ConnTracker) RoutedConnection(
 	uuid := metadata.User
 	sourceIP := metadata.Source.Addr.String()
 
+	if t.isRemovedUser(uuid) {
+		nlog.Core().Debug("singbox: rejecting connection of removed user", "user", uuid, "ip", sourceIP)
+		conn.Close()
+		return conn
+	}
+
 	t.usersMu.RLock()
 	uid := t.uuidMap[uuid]
 	us := t.users[uid]
@@ -236,32 +287,27 @@ func (t *ConnTracker) RoutedConnection(
 
 	connID := t.nextID()
 
-	// Store conn reference for force-close support
-	t.usersMu.Lock()
-	t.connMap[connID] = conn
-	t.usersMu.Unlock()
-
 	var lim *rate.Limiter
 	if slf := t.speedLimitFunc.Load(); slf != nil {
 		lim = (*slf)(uuid)
 	}
 
-	return &trackedConn{
+	tc := &trackedConn{
 		Conn:     conn,
 		tracker:  t,
 		us:       us,
 		userID:   uid,
+		uuid:     uuid,
 		connID:   connID,
 		sourceIP: sourceIP,
 		limiter:  lim,
 		ctx:      ctx,
 	}
+	t.addConnRef(uuid, connID, tc)
+	return tc
 }
 
-// RoutedPacketConnection wraps UDP with per-user counting (UDP not in connMap).
-// Note: UDP connections are NOT stored in connMap because connMap is typed as
-// map[string]net.Conn, but PacketConn is a different interface. Force-close
-// for UDP connections is handled directly via trackedPacketConn.Close().
+// RoutedPacketConnection wraps UDP with per-user counting.
 func (t *ConnTracker) RoutedPacketConnection(
 	ctx context.Context, conn N.PacketConn,
 	metadata adapter.InboundContext,
@@ -269,6 +315,12 @@ func (t *ConnTracker) RoutedPacketConnection(
 ) N.PacketConn {
 	uuid := metadata.User
 	sourceIP := metadata.Source.Addr.String()
+
+	if t.isRemovedUser(uuid) {
+		nlog.Core().Debug("singbox: rejecting UDP connection of removed user", "user", uuid, "ip", sourceIP)
+		conn.Close()
+		return conn
+	}
 
 	t.usersMu.RLock()
 	uid := t.uuidMap[uuid]
@@ -298,16 +350,19 @@ func (t *ConnTracker) RoutedPacketConnection(
 		lim = (*slf)(uuid)
 	}
 
-	return &trackedPacketConn{
+	tc := &trackedPacketConn{
 		PacketConn: conn,
 		tracker:    t,
 		us:         us,
 		userID:     uid,
+		uuid:       uuid,
 		connID:     connID,
 		sourceIP:   sourceIP,
 		limiter:    lim,
 		ctx:        ctx,
 	}
+	t.addConnRef(uuid, connID, tc)
+	return tc
 }
 
 // checkDeviceGate rejects connections exceeding device limit.
@@ -454,12 +509,23 @@ func (t *ConnTracker) CloseByID(id string) bool {
 	return true
 }
 
-// CloseByUUID force-closes ALL connections for a given user UUID.
+// CloseByUUID force-closes all TCP and UDP connections of a user UUID and
+// returns how many were closed.
 func (t *ConnTracker) CloseByUUID(uuid string) int {
-	// This is a no-op for now — sing-box doesn't expose per-user connection
-	// kill easily. The kernel's RemoveUsers removes the inbound user which
-	// prevents new connections, and existing connections will fail on next I/O.
-	return 0
+	t.usersMu.RLock()
+	conns := make([]io.Closer, 0, len(t.userConns[uuid]))
+	for id := range t.userConns[uuid] {
+		if c, ok := t.connMap[id]; ok {
+			conns = append(conns, c)
+		}
+	}
+	t.usersMu.RUnlock()
+
+	// Close outside the lock: Close calls back into removeConnRef.
+	for _, c := range conns {
+		c.Close()
+	}
+	return len(conns)
 }
 
 // ActiveCount returns the total number of active connections.
@@ -476,9 +542,15 @@ func (t *ConnTracker) ActiveCount() int {
 }
 
 // removeConnRef removes the connection reference from connMap on close.
-func (t *ConnTracker) removeConnRef(connID string) {
+func (t *ConnTracker) removeConnRef(uuid, connID string) {
 	t.usersMu.Lock()
 	delete(t.connMap, connID)
+	if ids := t.userConns[uuid]; ids != nil {
+		delete(ids, connID)
+		if len(ids) == 0 {
+			delete(t.userConns, uuid)
+		}
+	}
 	t.usersMu.Unlock()
 }
 
@@ -562,6 +634,7 @@ type trackedConn struct {
 	tracker  *ConnTracker
 	us       *userStats // per-user stats (upload/download atomics + IP tracking)
 	userID   int        // user ID for device tracking
+	uuid     string
 	connID   string
 	sourceIP string
 	limiter  *rate.Limiter
@@ -636,7 +709,7 @@ func (c *trackedConn) Close() error {
 		if c.us != nil {
 			c.us.removeConn(c.sourceIP)
 		}
-		c.tracker.removeConnRef(c.connID)
+		c.tracker.removeConnRef(c.uuid, c.connID)
 	}
 	return c.Conn.Close()
 }
@@ -691,6 +764,7 @@ type trackedPacketConn struct {
 	tracker  *ConnTracker
 	us       *userStats
 	userID   int
+	uuid     string
 	connID   string
 	sourceIP string
 	limiter  *rate.Limiter
@@ -759,7 +833,7 @@ func (c *trackedPacketConn) Close() error {
 		if c.us != nil {
 			c.us.removeConn(c.sourceIP)
 		}
-		c.tracker.removeConnRef(c.connID)
+		c.tracker.removeConnRef(c.uuid, c.connID)
 	}
 	return c.PacketConn.Close()
 }
