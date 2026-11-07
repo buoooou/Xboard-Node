@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -69,6 +70,7 @@ type KernelOverride struct {
 	GeoDataDir   string `yaml:"geo_data_dir,omitempty"`
 	LogLevel     string `yaml:"log_level,omitempty"`
 	CustomConfig string `yaml:"custom_config,omitempty"`
+	RealityDest  string `yaml:"reality_dest,omitempty"`
 }
 
 // RuntimeConfig tunes Go runtime memory behaviour.
@@ -142,6 +144,13 @@ type KernelConfig struct {
 	// customization of dns, outbounds, endpoints, route, experimental, etc.
 	// Compatible with V2bX OriginalPath format.
 	CustomConfig string `yaml:"custom_config"`
+
+	// RealityDest overrides the Reality fallback target (host:port) that the
+	// panel would otherwise derive from reality_settings.server_name. Use it to
+	// "steal" a site served on this machine, e.g. "127.0.0.1:8443" where nginx
+	// serves server_name with a valid certificate. The SNI clients must send is
+	// still reality_settings.server_name. Empty = derive from the panel.
+	RealityDest string `yaml:"reality_dest"`
 }
 
 type CertConfig struct {
@@ -407,6 +416,9 @@ func (c *Config) applyEnvOverrides() {
 	if v := envFirst("kernel", "KERNEL_TYPE"); v != "" {
 		c.Kernel.Type = v
 	}
+	if v := envFirst("realityDest", "REALITY_DEST"); v != "" {
+		c.Kernel.RealityDest = v
+	}
 	if v := envFirst("certFile", "CERT_FILE"); v != "" {
 		c.Cert.CertFile = v
 	}
@@ -506,6 +518,9 @@ func (c *Config) inheritFrom(parent *Config) {
 	}
 	if c.Kernel.CustomConfig == "" {
 		c.Kernel.CustomConfig = parent.Kernel.CustomConfig
+	}
+	if c.Kernel.RealityDest == "" {
+		c.Kernel.RealityDest = parent.Kernel.RealityDest
 	}
 	if len(c.Kernel.CustomOutbound) == 0 {
 		c.Kernel.CustomOutbound = parent.Kernel.CustomOutbound
@@ -724,6 +739,17 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("kernel.type must be 'singbox' or 'xray', got '%s'", c.Kernel.Type)
 	}
+	if err := ValidateRealityDest(c.Kernel.RealityDest); err != nil {
+		return err
+	}
+	for i, n := range c.Nodes {
+		if n.Kernel == nil {
+			continue
+		}
+		if err := ValidateRealityDest(n.Kernel.RealityDest); err != nil {
+			return fmt.Errorf("nodes[%d]: %w", i, err)
+		}
+	}
 	if c.Cert.AutoTLS && c.Cert.Domain == "" {
 		return fmt.Errorf("cert.domain is required when cert.auto_tls is enabled")
 	}
@@ -770,6 +796,9 @@ func (c *Config) ExpandNodes() []*Config {
 			}
 			if entry.Kernel.CustomConfig != "" {
 				nodeCfg.Kernel.CustomConfig = entry.Kernel.CustomConfig
+			}
+			if entry.Kernel.RealityDest != "" {
+				nodeCfg.Kernel.RealityDest = entry.Kernel.RealityDest
 			}
 		} else {
 			// Auto-derive a unique config_dir per node to avoid conflicts.
@@ -901,6 +930,22 @@ func ValidateStartupLayout(instances []*Config) error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+// ValidateRealityDest checks that kernel.reality_dest, when set, is host:port.
+func ValidateRealityDest(dest string) error {
+	dest = strings.TrimSpace(dest)
+	if dest == "" {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(dest)
+	if err != nil || host == "" {
+		return fmt.Errorf("kernel.reality_dest must be host:port (e.g. 127.0.0.1:8443), got %q", dest)
+	}
+	if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+		return fmt.Errorf("kernel.reality_dest port must be between 1 and 65535, got %q", dest)
 	}
 	return nil
 }

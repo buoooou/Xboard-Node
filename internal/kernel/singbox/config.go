@@ -19,6 +19,8 @@ import (
 type M = map[string]interface{}
 
 func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
+	nc = kernel.ApplyRealityDest(nc, kcfg.RealityDest)
+
 	var outbounds []M
 	tags := make(map[string]bool)
 
@@ -933,9 +935,9 @@ func buildRealityConfig(nc *model.NodeSpec) M {
 
 	if dest != "" {
 		handshake := M{"server": dest, "server_port": 443}
-		if parts := strings.SplitN(dest, ":", 2); len(parts) == 2 {
-			handshake["server"] = parts[0]
-			if p, err := strconv.Atoi(parts[1]); err == nil {
+		if host, port, err := net.SplitHostPort(dest); err == nil {
+			handshake["server"] = host
+			if p, err := strconv.Atoi(port); err == nil {
 				handshake["server_port"] = p
 			}
 		} else if settings.ServerPort > 0 {

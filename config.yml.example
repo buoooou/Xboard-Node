@@ -24,3 +24,11 @@
 #       token: "machine-token-2"
 #     log:
 #       level: "debug"   # override for this instance only
+
+# ── Reality "self-steal" ──
+# By default the Reality fallback target is reality_settings.server_name:443.
+# When server_name is your own domain pointing at this machine, that target is
+# the node itself and the fallback loops. Serve the domain from a local web
+# server with a valid certificate and point the fallback at it instead:
+# kernel:
+#   reality_dest: "127.0.0.1:8443"   # or env REALITY_DEST; per node: nodes[].kernel.reality_dest
